@@ -128,6 +128,19 @@ public class NFCPassportModel {
     public private(set) var activeAuthenticationSignature : [UInt8] = []
     public private(set) var verificationErrors : [Error] = []
 
+    /**
+     fravash: data groups whose bytes arrived but could not be parsed.
+
+     A READ THAT SKIPS SOMETHING MUST SAY SO. Tolerating an unparsable data group
+     stops one bad portrait costing a whole enrolment, but a tolerance nobody can
+     see is worse than the abort it replaced: the caller would render a confident
+     result over a passport it only partly understood. Anything in here is a
+     thing we did not get, named, so a caller can decide what to tell the person.
+
+     Empty is the normal case and means every requested data group parsed.
+     */
+    public private(set) var dataGroupErrors : [DataGroupId: Error] = [:]
+
     public var isPACESupported : Bool {
         get {
             if cardAccess?.paceInfo != nil {
@@ -223,6 +236,13 @@ public class NFCPassportModel {
         if id != .COM && id != .SOD {
             self.dataGroupsAvailable.append( id )
         }
+    }
+
+    /// fravash: record that a data group was requested, arrived, and could not be
+    /// parsed. It is deliberately NOT added to `dataGroupsAvailable`: it is not
+    /// available, and a caller iterating that list must not see it.
+    public func addDataGroupError(_ id : DataGroupId, error: Error ) {
+        self.dataGroupErrors[id] = error
     }
 
     public func getDataGroup( _ id : DataGroupId ) -> DataGroup? {

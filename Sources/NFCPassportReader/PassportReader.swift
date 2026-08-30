@@ -73,6 +73,28 @@ public class PassportReader : NSObject {
     // the previous OpenSSL CMS verification if necessary
     public var passiveAuthenticationUsesOpenSSL : Bool = false
 
+    /**
+     fravash: data groups that may fail to PARSE without aborting the whole read.
+
+     EMPTY BY DEFAULT, so existing callers keep the behaviour they have. A caller
+     that has not thought about a missing data group should keep getting the
+     abort rather than a quietly incomplete passport.
+
+     Only CONTENT failures are tolerated, and only for the data groups named
+     here. A lost tag, a broken secure messaging session or a failed
+     authentication still aborts, whatever is in this list. See
+     `NFCPassportReaderError.isContentFailure`.
+
+     Anything skipped is recorded in `NFCPassportModel.dataGroupErrors`, so a
+     caller can tell the difference between "this passport has no portrait" and
+     "we could not read the portrait" and say the right thing to the person.
+
+     DO NOT PUT DG1 OR SOD IN HERE. They carry the identity and the issuing
+     state's signature, so a read that lost either has produced nothing worth
+     having and should fail loudly.
+     */
+    public var tolerateContentFailuresIn : [DataGroupId] = []
+
     public init( masterListURL: URL? = nil ) {
         super.init()
         
@@ -396,8 +418,36 @@ extension PassportReader {
         }
         for dgId in DGsToRead {
             self.updateReaderSessionMessage( alertMessage: NFCViewDisplayMessage.readingDataGroupProgress(dgId, 0) )
-            if let dg = try await readDataGroup(tagReader:tagReader, dgId:dgId) {
-                self.passport.addDataGroup( dgId, dataGroup:dg )
+            /* fravash: ONE UNPARSABLE DATA GROUP USED TO COST THE WHOLE READ.
+               This loop was unguarded, so any failure on any data group threw out
+               of `readDataGroups` and aborted everything, including the data
+               groups that had already been read successfully.
+
+               That is right for a lost tag and wrong for an unreadable portrait.
+               ICAO permits both JPEG and JPEG 2000 in DG2, and is migrating DG2
+               from ISO/IEC 19794-5 to 39794-5 (States may issue either until
+               2030), so a document this library cannot render is not exotic, it
+               is the normal near future. Before this change, such a passport
+               could not be enrolled AT ALL, and the person saw a generic failure
+               rather than "we could not read the photo".
+
+               THE TOLERANCE IS OPT IN AND NAMES ITS DATA GROUPS. Silently
+               widening the default would change behaviour for every existing
+               caller, and a caller that has not thought about a missing data
+               group should keep getting the abort. */
+            do {
+                if let dg = try await readDataGroup(tagReader:tagReader, dgId:dgId) {
+                    self.passport.addDataGroup( dgId, dataGroup:dg )
+                }
+            } catch let error as NFCPassportReaderError where
+                        tolerateContentFailuresIn.contains(dgId) && error.isContentFailure {
+                /* SAFE TO CONTINUE, and the reason is specific rather than
+                   optimistic: `parseDG` runs on bytes the APDU exchange already
+                   returned, so secure messaging is still established and the next
+                   data group reads normally. A session failure has no such
+                   guarantee, which is why `isContentFailure` gates this. */
+                Logger.passportReader.warning( "Tolerating unparsable \(dgId.getName()) - \(error.value)" )
+                self.passport.addDataGroupError( dgId, error: error )
             }
         }
     }

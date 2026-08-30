@@ -148,3 +148,72 @@ extension PassiveAuthenticationError: LocalizedError {
         }
     }
 }
+
+// MARK: - fravash: content failures versus session failures
+@available(iOS 13, macOS 10.15, *)
+extension NFCPassportReaderError {
+
+    /**
+     Whether this error means "the bytes arrived and we could not interpret them",
+     as opposed to "the chip is gone".
+
+     WHY THE DISTINCTION EXISTS. `readDataGroups` reads every data group in one
+     unguarded loop, so ANY failure on ANY data group aborts the whole read. That
+     is right for a lost tag and wrong for an unreadable portrait: DG2 failing to
+     parse costs a passport holder their entire enrolment, when DG1 and the
+     security object, which are the parts that actually carry identity, arrived
+     intact.
+
+     It is safe to continue after a content failure because the APDU exchange
+     already SUCCEEDED. `parseDG` runs on bytes `tagReader.readDataGroup` has
+     returned, so secure messaging is still established and the next data group
+     can be read normally. A session failure has no such guarantee.
+
+     A CLOSED SWITCH WITH NO `default`, deliberately. A new case must be
+     classified by whoever adds it, at compile time, rather than falling into
+     whichever answer happened to be the default. Getting this wrong in the
+     lenient direction hides real failures forever; getting it wrong in the
+     strict direction shows up on the next read.
+     */
+    public var isContentFailure: Bool {
+        switch self {
+        // The bytes are here and we cannot read them. Recoverable per data group.
+        case .UnknownImageFormat,
+             .InvalidResponse,
+             .CannotDecodeASN1Length,
+             .InvalidASN1Value,
+             .UnknownTag,
+             .UnsupportedDataGroup,
+             .MissingMandatoryFields,
+             .NotImplemented,
+             .NotYetSupported:
+            return true
+
+        // The session, the tag, the crypto or the caller. Continuing is either
+        // impossible or dishonest, so these stay fatal.
+        case .ResponseError,
+             .UnexpectedError,
+             .NFCNotSupported,
+             .NoConnectedTag,
+             .D087Malformed,
+             .InvalidResponseChecksum,
+             .UnableToProtectAPDU,
+             .UnableToUnprotectAPDU,
+             .DataGroupNotRead,
+             .TagNotValid,
+             .ConnectionError,
+             .TimeOutError,
+             .UserCanceled,
+             .InvalidMRZKey,
+             .MoreThanOneTagFound,
+             .InvalidHashAlgorithmSpecified,
+             .UnsupportedCipherAlgorithm,
+             .UnsupportedMappingType,
+             .PACEError,
+             .ChipAuthenticationFailed,
+             .InvalidDataPassed,
+             .Unknown:
+            return false
+        }
+    }
+}
