@@ -195,7 +195,7 @@ public class OpenSSLUtils {
         }
         defer { X509_STORE_CTX_free(store) }
         
-        X509_STORE_set_flags(cert_ctx, 0)
+        X509_STORE_set_flags(cert_ctx, UInt(X509_V_FLAG_PARTIAL_CHAIN))  // fravash: an ICAO master list is a list of ANCHORS, not a chain
         rc = X509_STORE_CTX_init(store, cert_ctx, x509.cert, nil)
         if rc == 0 {
             return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to initialise X509_STORE_CTX"))
