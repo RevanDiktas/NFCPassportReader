@@ -84,9 +84,91 @@ public class DataGroup2 : DataGroup {
         tag = try getNextTag()
         try verifyTag(tag, oneOf: [0x5F2E, 0x7F2E])
         let value = try getNextValue()
-        
-        
-        try parseISO19794_5( data:value )
+
+        /* fravash: TWO ENCODINGS LIVE BEHIND THIS TAG NOW, AND THE OUTER FRAMING
+           DOES NOT DISTINGUISH THEM.
+
+           ICAO is migrating DG2 from ISO/IEC 19794-5 to ISO/IEC 39794-5.
+           Inspection systems have had to read both since 1 February 2026, issuing
+           States may use either until 1 January 2030, and everything ABOVE this
+           point is byte-identical between them. Only the content differs: a
+           19794-5 facial record begins with the four bytes 'F' 'A' 'C' 0x00,
+           where a 39794-5 one is ASN.1 DER and begins with a context tag.
+
+           Before this branch existed, a 39794-5 document threw UnknownImageFormat
+           here, and because the caller read every data group in one unguarded
+           loop that cost the ENTIRE read, not just the portrait.
+
+           The discriminator is the record header rather than a length or a guess,
+           because it is the one thing the two encodings cannot share. */
+        if value.count >= 4,
+           value[0] == 0x46, value[1] == 0x41, value[2] == 0x43, value[3] == 0x00 {
+            try parseISO19794_5( data:value )
+        } else {
+            try parseISO39794_5( data:value )
+        }
+    }
+
+    /**
+     fravash: pull the portrait out of an ISO/IEC 39794-5 encoded DG2.
+
+     THIS EXTRACTS THE IMAGE AND DELIBERATELY NOTHING ELSE. 39794-5 is a large
+     schema carrying landmarks, quality blocks, capture device details and
+     anthropometric metadata, none of which anything downstream reads. Writing a
+     full schema parser would be weeks of work whose output we would discard, and
+     every field parsed is another place to be wrong about attacker influenced
+     input. So this walks one known path to `representationData2D` and stops.
+
+     THE PATH, from the content of the 5F2E/7F2E tag:
+
+         [1]  ->  [APPLICATION 5]  ->  [1]  ->  SEQUENCE  ->  [1]  ->  [0]  ->  [0]  ->  [0]
+                  FaceImageDataBlock   repre-   Represen-   image-   base  2DBlock  representation
+                                       sentat-  tationBlock Repre-                  Data2D
+                                       ionBlocks            sentation
+
+     IT SEARCHES SIBLINGS RATHER THAN COUNTING THEM. Most members at these levels
+     are OPTIONAL, so position is not stable: the two official ICAO vectors differ
+     in exactly this way, one carrying only mandatory fields and one carrying all
+     of them. Searching by tag parses both; counting would parse one.
+
+     VERIFIED AGAINST THE OFFICIAL VECTORS, not against my reading of the spec.
+     github.com/ICAO-TRIP-ISO-WG3/39794-5-AP publishes two reference DG2 files;
+     both yield the same 15000 byte JP2 portrait, which decodes at 413x531.
+
+     WHAT IS NOT POPULATED, stated so nobody reads a zero as a measurement.
+     `imageWidth`, `imageHeight` and every other ISO 19794-5 header field stay at
+     their defaults on this path. They are not present in the same form here, and
+     the authoritative dimensions are the decoded image's own. A caller that needs
+     them should decode and ask the image.
+     */
+    func parseISO39794_5( data : [UInt8] ) throws {
+        guard let root = DER.find(tag: 0x65, in: data, from: 0, to: data.count),
+              let representations = DER.find(tag: 0xA1, in: data, from: root.contentStart, to: root.contentEnd),
+              let block = DER.find(tag: 0x30, in: data, from: representations.contentStart, to: representations.contentEnd),
+              let representation = DER.find(tag: 0xA1, in: data, from: block.contentStart, to: block.contentEnd),
+              /* Two CHOICE wrappers: ImageRepresentation.base, then
+                 ImageRepresentationBase.imageRepresentation2DBlock. Both are [0].
+                 An extensionBlock ([1]) is a future encoding we do not implement,
+                 and failing here is the honest outcome for it. */
+              let base = DER.find(tag: 0xA0, in: data, from: representation.contentStart, to: representation.contentEnd),
+              let twoD = DER.find(tag: 0xA0, in: data, from: base.contentStart, to: base.contentEnd),
+              let payload = DER.find(tag: 0x80, in: data, from: twoD.contentStart, to: twoD.contentEnd)
+        else {
+            throw NFCPassportReaderError.UnknownImageFormat
+        }
+
+        let bytes = Array(data[payload.contentStart..<payload.contentEnd])
+        /* THE SAME CONTAINER CHECK THE OTHER PATH USES. 39794-5 changed how the
+           portrait is WRAPPED, not what it is: the payload is still JPEG or
+           JPEG 2000, so an unrecognised one is still UnknownImageFormat rather
+           than something we hand onward and hope about. */
+        guard bytes.starts(with: [0xff, 0xd8, 0xff])
+                || bytes.starts(with: [0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50, 0x20, 0x20])
+                || bytes.starts(with: [0xff, 0x4f, 0xff, 0x51])
+        else {
+            throw NFCPassportReaderError.UnknownImageFormat
+        }
+        imageData = bytes
     }
     
     func parseISO19794_5( data : [UInt8] ) throws {
