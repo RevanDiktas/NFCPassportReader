@@ -79,6 +79,18 @@ public class PassportReader : NSObject {
 
     public private(set) var lastSessionInvalidation: SessionInvalidation?
 
+    /**
+     fravash: what the chip published about itself, for the caller to record.
+
+     MEASUREMENT ONLY. Nothing in this reader consults it. It is here so that a
+     debug build can report, across real documents, whether extended length APDUs
+     are available at all, since that answer decides whether a much larger piece
+     of work is worth starting. Nil until a tag is connected, and cleared per read
+     for the same reason `lastSessionInvalidation` is: a value left over from the
+     previous attempt would be read as belonging to this one.
+     */
+    public private(set) var lastCardCapabilities: CardCapabilities?
+
     private var passport : NFCPassportModel = NFCPassportModel()
     
     private var readerSession: NFCTagReaderSession?
@@ -155,6 +167,7 @@ public class PassportReader : NSObject {
         /* fravash: cleared per read, so a reason left over from the previous
            attempt cannot be read as belonging to this one. */
         self.lastSessionInvalidation = nil
+        self.lastCardCapabilities = nil
         self.mrzKey = mrzKey
         self.aaChallenge = aaChallenge
         self.skipCA = skipCA
@@ -282,7 +295,11 @@ extension PassportReader : NFCTagReaderSessionDelegate {
                 self.updateReaderSessionMessage( alertMessage: NFCViewDisplayMessage.authenticatingWithPassport(0) )
                 
                 let tagReader = TagReader(tag:passportTag)
-                
+                /* fravash: recorded the moment the tag is connected, before any
+                   command is sent, because it comes from the ATS rather than from
+                   the chip's files and costs no round trip. */
+                self.lastCardCapabilities = tagReader.cardCapabilities
+
                 if let newAmount = self.dataAmountToReadOverride {
                     tagReader.overrideDataAmountToRead(newAmount: newAmount)
                 }

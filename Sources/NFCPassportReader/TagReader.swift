@@ -20,8 +20,30 @@ public class TagReader {
 
     var progress : ((Int)->())?
 
+    /**
+     fravash: what the chip said it can do, read once at connect and never acted on.
+
+     MEASUREMENT ONLY, TODAY. Nothing in this class changes behaviour based on
+     this value. It exists so we can find out, across real documents, whether
+     extended length APDUs are even available before spending days building them.
+     See `CardCapabilities` for why that question is worth about seven seconds a
+     read, and see the note in `SecureMessaging.protect` for why turning it on is
+     not a one line change: the extended path there encodes the outer Le as
+     `00 00`, which means 65536, correct for Active Authentication and wrong for
+     READ BINARY, where it would over-read past end of file on every final chunk.
+
+     TYPE B DOCUMENTS ANSWER "UNKNOWN" AND THAT IS CORRECT RATHER THAN A GAP.
+     `historicalBytes` is the ISO 14443 Type A ATS. A Type B chip publishes its
+     capabilities differently, in the ATQB application data, so it parses to
+     `unknown` and therefore to "no extended length". Fail closed, as everywhere
+     else in that type.
+     */
+    public let cardCapabilities : CardCapabilities
+
     init( tag: NFCISO7816Tag ) {
         self.tag = tag
+        self.cardCapabilities = CardCapabilities.parse(
+            historicalBytes: [UInt8](tag.historicalBytes ?? Data()))
     }
     
     func overrideDataAmountToRead( newAmount : Int ) {
