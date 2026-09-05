@@ -20,6 +20,33 @@ public enum PassportAuthenticationStatus {
     case failed
 }
 
+/**
+ fravash: one row of EF.SOD's DataGroupHashValues, exactly as the document
+ carries it.
+
+ DELIBERATELY NOT KEYED BY `DataGroupId`. The number is what gets committed to,
+ and the enum cannot carry it faithfully: `dgList` maps 0 to `.COM` and 17 to
+ `.SOD`, has nothing at all above 17, and a consumer turning a case back into a
+ number collapses everything it does not recognise onto 0. Two SOD rows can land
+ on one key that way, and the number recorded can differ from the number another
+ implementation reads off the same bytes. The reference implementation this must
+ agree with byte for byte, `packages/eid/src/sod.ts`, carries the raw ASN.1
+ INTEGER through untouched, so this does too.
+
+ A row here is what was PARSED, not what was verified. See `sodDataGroupHashes`.
+ */
+public struct SodDataGroupHash : Equatable {
+    /// The raw INTEGER from the SOD, unmapped and unvalidated.
+    public let dataGroupNumber : Int
+    /// Hex, exactly as parsed, neither case normalised nor length checked.
+    public let hash : String
+
+    public init( dataGroupNumber: Int, hash: String ) {
+        self.dataGroupNumber = dataGroupNumber
+        self.hash = hash
+    }
+}
+
 @available(iOS 13, macOS 10.15, *)
 public class NFCPassportModel {
     
@@ -114,6 +141,51 @@ public class NFCPassportModel {
     public private(set) var dataGroupsAvailable = [DataGroupId]()
     public private(set) var dataGroupsRead : [DataGroupId:DataGroup] = [:]
     public private(set) var dataGroupHashes = [DataGroupId: DataGroupHash]()
+
+    /**
+     fravash: the COMPLETE hash table the issuing state signed, in the order the
+     SOD lists it, duplicates included, independent of which data groups this
+     read recovered.
+
+     `dataGroupHashes` ABOVE IS NOT THIS TABLE, THOUGH IT LOOKS LIKE IT. It is
+     built by walking `dataGroupsRead`, so its keys are the groups this read
+     happened to get and parse, minus SOD and COM. A tolerated parse failure
+     (see `dataGroupErrors`) drops a group from `dataGroupsRead` and therefore
+     from `dataGroupHashes`, on a document whose SOD still signs it. Anything
+     deriving a STABLE value from a document must commit over the signed table,
+     which is this one, and never over a set that depends on how the read went.
+
+     NOT DEDUPED, NOT SORTED, NOT FILTERED. A repeated data group number is a
+     forgery signal: two candidate hashes for one group let a lenient verifier
+     match either. It is left in rather than resolved here, so that a caller can
+     refuse it, and so that this stays a faithful record rather than a judgement.
+     A number outside the range this parser can name is kept too, because the
+     state signed it whether or not we recognise it.
+
+     POPULATED DOES NOT MEAN VERIFIED. It is assigned as soon as the SOD's
+     content parses, which is BEFORE the tamper comparison runs and before that
+     comparison can throw, and `verifyPassport` swallows the throw into
+     `verificationErrors`. A document that failed passive authentication still
+     leaves a full table here. Check `passportCorrectlySigned` and
+     `passportDataNotTampered` before trusting it for anything.
+
+     Empty until `verifyPassport` has run.
+     */
+    public private(set) var sodDataGroupHashes : [SodDataGroupHash] = []
+
+    /**
+     fravash: the digest algorithm the SOD declares, as
+     `parseSODSignatureContent` returns it: "SHA1", "SHA224", "SHA256", "SHA384"
+     or "SHA512".
+
+     Carried alongside `sodDataGroupHashes` because those hashes are meaningless
+     without it: the same document under a different algorithm is a different
+     table. Assigned at the same moment and under the same caveat, so read
+     `passportCorrectlySigned` and `passportDataNotTampered` first.
+
+     Empty until `verifyPassport` has run.
+     */
+    public private(set) var sodHashAlgorithm : String = ""
 
     public internal(set) var cardAccess : CardAccess?
     public internal(set) var BACStatus : PassportAuthenticationStatus = .notDone
@@ -469,7 +541,18 @@ public class NFCPassportModel {
         // computed hashes to ensure data not been tampered with
         passportDataNotTampered = false
         let asn1Data = try OpenSSLUtils.ASN1Parse( data: signedData )
-        let (sodHashAlgorythm, sodHashes) = try parseSODSignatureContent( asn1Data )
+        let (sodHashAlgorythm, sodHashes, sodRows) = try parseSODSignatureContent( asn1Data )
+
+        /* fravash: KEEP WHAT THE STATE SIGNED, BEFORE THE LOOP NARROWS IT.
+           The full signed table has been a local that this function threw away.
+           The loop below reduces it to the groups actually read, which is the
+           right input for a tamper check and the wrong one for anything that
+           must be stable across reads. Recorded here, before the comparison, so
+           the record is of what the SOD SAID rather than of what this read
+           managed to confirm. Refusing to derive from an unverified document is
+           the caller's job and the doc comments say so. */
+        self.sodDataGroupHashes = sodRows
+        self.sodHashAlgorithm = sodHashAlgorythm
         
         var errors : String = ""
         for (id,dgVal) in dataGroupsRead {
@@ -505,10 +588,14 @@ public class NFCPassportModel {
     /// Parses an text ASN1 structure, and extracts the Hash Algorythm and Hashes contained from the Octect strings
     /// - Parameter content: the text ASN1 stucure format
     /// - Returns: The Hash Algorythm used - either SHA1 or SHA256, and a dictionary of hashes for the datagroups (currently only DG1 and DG2 are handled)
-    private func parseSODSignatureContent( _ content : String ) throws -> (String, [DataGroupId : String]){
+    private func parseSODSignatureContent( _ content : String ) throws -> (String, [DataGroupId : String], [SodDataGroupHash]){
         var currentDG = ""
         var sodHashAlgo = ""
         var sodHashes :  [DataGroupId : String] = [:]
+        /* fravash: every row as the SOD carries it, keeping the raw number that
+           `sodHashes` cannot represent. Appended in document order and never
+           deduped: see `SodDataGroupHash`. */
+        var sodRows : [SodDataGroupHash] = []
         
         let lines = content.components(separatedBy: "\n")
         
@@ -539,7 +626,19 @@ public class NFCPassportModel {
                 if let range = line.range(of: "[HEX DUMP]:") {
                     let val = line[range.upperBound..<line.endIndex]
                     if currentDG != "", let id = Int(currentDG, radix:16) {
-                        sodHashes[dgList[id]] = String(val)
+                        /* fravash: the raw row first, because it is the one
+                           thing here that cannot be wrong. */
+                        sodRows.append( SodDataGroupHash( dataGroupNumber: id, hash: String(val) ) )
+
+                        /* fravash: AND ONLY THEN THE MAPPED ONE, IF IT MAPS.
+                           `id` is parsed straight out of the document and is
+                           unbounded; `dgList` has 18 entries. An SOD declaring
+                           data group 0x20, or a negative INTEGER, crashed here.
+                           An unmappable number is skipped rather than dropped:
+                           it is already in `sodRows` above. */
+                        if id >= 0 && id < dgList.count {
+                            sodHashes[dgList[id]] = String(val)
+                        }
                         currentDG = ""
                     }
                 }
@@ -556,6 +655,6 @@ public class NFCPassportModel {
         Logger.passportReader.debug( "Parse SOD - Using Algo - \(sodHashAlgo)" )
         Logger.passportReader.debug( "      - Hashes     - \(sodHashes)" )
         
-        return (sodHashAlgo, sodHashes)
+        return (sodHashAlgo, sodHashes, sodRows)
     }
 }
