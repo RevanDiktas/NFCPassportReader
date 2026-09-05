@@ -43,6 +43,42 @@ public class PassportReader : NSObject {
     private var nfcContinuation: NFCCheckedContinuation?
 
     public weak var trackingDelegate: PassportReaderTrackingDelegate?
+
+    /**
+     fravash: WHY iOS TORE THE SESSION DOWN, KEPT WHERE THE CALLER CAN STILL SEE IT.
+
+     THE RACE THIS EXISTS TO SURVIVE. Two paths resume the same continuation and
+     only one of them knows anything. `didInvalidateWithError` is handed the real
+     reason by CoreNFC and maps it: 200 user cancelled, 201 session timeout,
+     anything else `UnexpectedError`. Meanwhile the transceive that was in flight
+     when the session died throws `NFCError` 103 immediately, lands in the generic
+     catch in `didDetect`, and becomes `.Unknown(error)`. Whichever resumes first
+     nils the continuation and the other is discarded.
+
+     In practice the 103 wins, so the caller is told "Unknown error: Session
+     invalidated" and the ANSWER, which is 201 timeout or 202 terminated
+     unexpectedly or 203 system is busy, three different bugs with three different
+     fixes, is thrown on the floor.
+
+     THIS DOES NOT CHANGE WHICH ERROR IS THROWN, DELIBERATELY. Changing the winner
+     of that race is a behaviour change and this is a diagnosis. The reason is
+     merely recorded, before anything resumes, so a caller that has just caught a
+     bare 103 can ask what actually happened.
+
+     NIL IS A FINDING, NOT AN ABSENCE OF ONE. It is cleared at the start of every
+     read, so a 103 with nothing here means nothing invalidated the session and it
+     died some other way.
+
+     NOTHING PERSONAL IS IN IT. A domain, an integer and CoreNFC's own sentence.
+     */
+    public struct SessionInvalidation {
+        public let domain: String
+        public let code: Int
+        public let localizedDescription: String
+    }
+
+    public private(set) var lastSessionInvalidation: SessionInvalidation?
+
     private var passport : NFCPassportModel = NFCPassportModel()
     
     private var readerSession: NFCTagReaderSession?
@@ -116,6 +152,9 @@ public class PassportReader : NSObject {
     public func readPassport( mrzKey : String, tags : [DataGroupId] = [], aaChallenge: [UInt8]? = nil, skipSecureElements : Bool = true, skipCA : Bool = false, skipPACE : Bool = false, useExtendedMode : Bool = false, customDisplayMessage : ((NFCViewDisplayMessage) -> String?)? = nil) async throws -> NFCPassportModel {
         
         self.passport = NFCPassportModel()
+        /* fravash: cleared per read, so a reason left over from the previous
+           attempt cannot be read as belonging to this one. */
+        self.lastSessionInvalidation = nil
         self.mrzKey = mrzKey
         self.aaChallenge = aaChallenge
         self.skipCA = skipCA
@@ -171,6 +210,17 @@ extension PassportReader : NFCTagReaderSessionDelegate {
         // If necessary, you may handle the error. Note session is no longer valid.
         // You must create a new session to restart RF polling.
         Logger.passportReader.debug( "tagReaderSession:didInvalidateWithError - \(error.localizedDescription)" )
+
+        /* fravash: BEFORE ANYTHING ELSE IN THIS FUNCTION, and that ordering is the
+           whole point. Every other statement here can resume the continuation and
+           hand control back to a caller that will immediately want to know this.
+           See `SessionInvalidation`. */
+        let invalidationError = error as NSError
+        self.lastSessionInvalidation = SessionInvalidation(
+            domain: invalidationError.domain,
+            code: invalidationError.code,
+            localizedDescription: invalidationError.localizedDescription)
+
         self.readerSession?.invalidate()
         self.readerSession = nil
 
@@ -258,9 +308,26 @@ extension PassportReader : NFCTagReaderSessionDelegate {
 
                 // .readerTransceiveErrorTagResponseError is thrown when a "connection lost" scenario is forced by moving the phone away from the NFC chip
                 // .readerTransceiveErrorTagConnectionLost is never thrown for this scenario, but added for the sake of completeness
+                /* fravash: THREE MORE TRANSCEIVE ERRORS, AND THIS IS A SENTENCE FIX
+                   RATHER THAN A BUG FIX. It must not be mistaken for one.
+
+                   Only 100 and 102 were listed, so 101 retry exceeded, 103 session
+                   invalidated and 104 tag not connected all fell through to
+                   `.Unknown(error)`. Downstream, `ReadFailure` has no arm for
+                   `.Unknown`, so a real passport that lost its session mid read
+                   showed its holder "Something went wrong while reading the
+                   document", the most generic sentence we have, when the honest
+                   one is that contact was lost. All five are the same thing to a
+                   person: the phone and the document stopped talking.
+
+                   IT DOES NOT MAKE THE READ WORK. The session still dies. This
+                   only stops us describing it as an unknown internal error. */
                 if let nfcError = error as? NFCReaderError,
                    nfcError.errorCode == NFCReaderError.readerTransceiveErrorTagResponseError.rawValue ||
-                    nfcError.errorCode == NFCReaderError.readerTransceiveErrorTagConnectionLost.rawValue {
+                    nfcError.errorCode == NFCReaderError.readerTransceiveErrorTagConnectionLost.rawValue ||
+                    nfcError.errorCode == NFCReaderError.readerTransceiveErrorRetryExceeded.rawValue ||
+                    nfcError.errorCode == NFCReaderError.readerTransceiveErrorSessionInvalidated.rawValue ||
+                    nfcError.errorCode == NFCReaderError.readerTransceiveErrorTagNotConnected.rawValue {
                     let errorMessage = NFCViewDisplayMessage.error(NFCPassportReaderError.ConnectionError)
                     self.invalidateSession(errorMessage: errorMessage, error: NFCPassportReaderError.ConnectionError)
                 } else {
