@@ -540,8 +540,10 @@ public class NFCPassportModel {
         // Now Verify passport data by comparing compare Hashes in SOD against
         // computed hashes to ensure data not been tampered with
         passportDataNotTampered = false
-        let asn1Data = try OpenSSLUtils.ASN1Parse( data: signedData )
-        let (sodHashAlgorythm, sodHashes, sodRows) = try parseSODSignatureContent( asn1Data )
+        /* fravash: THE BYTES, NOT A RENDERING OF THEM. This used to be
+           `OpenSSLUtils.ASN1Parse(data:)` followed by a scrape of the human
+           readable dump it returns. See `parseSODSignatureContent`. */
+        let (sodHashAlgorythm, sodHashes, sodRows) = try parseSODSignatureContent( signedData )
 
         /* fravash: KEEP WHAT THE STATE SIGNED, BEFORE THE LOOP NARROWS IT.
            The full signed table has been a local that this function threw away.
@@ -553,6 +555,17 @@ public class NFCPassportModel {
            the caller's job and the doc comments say so. */
         self.sodDataGroupHashes = sodRows
         self.sodHashAlgorithm = sodHashAlgorythm
+
+        /* fravash: REFUSED HERE RATHER THAN INSIDE THE PARSER, so the rows
+           survive the refusal. The parser used to throw on an empty mapped
+           table before `sodDataGroupHashes` had been assigned, so a document
+           that failed this check left NO readable record of what its SOD
+           actually said, which is precisely the document somebody needs the
+           record for. Assign first, refuse second. */
+        if sodHashes.count == 0 {
+            throw PassiveAuthenticationError.UnableToParseSODHashes( "Unable to extract hashes" )
+        }
+
         
         var errors : String = ""
         for (id,dgVal) in dataGroupsRead {
@@ -585,76 +598,165 @@ public class NFCPassportModel {
     }
     
     
-    /// Parses an text ASN1 structure, and extracts the Hash Algorythm and Hashes contained from the Octect strings
-    /// - Parameter content: the text ASN1 stucure format
-    /// - Returns: The Hash Algorythm used - either SHA1 or SHA256, and a dictionary of hashes for the datagroups (currently only DG1 and DG2 are handled)
-    private func parseSODSignatureContent( _ content : String ) throws -> (String, [DataGroupId : String], [SodDataGroupHash]){
-        var currentDG = ""
-        var sodHashAlgo = ""
-        var sodHashes :  [DataGroupId : String] = [:]
+    /**
+     Read the LDSSecurityObject out of the SOD's signed content, as DER.
+
+     fravash: THIS WALKED THE TEXT OF AN OPENSSL DUMP UNTIL 2026-09-14, keying
+     off `d=2 OBJECT`, `d=3 INTEGER` and `d=3 OCTET STRING` and pulling values
+     out of string ranges. A cross-implementation vector against
+     `packages/eid/src/sod.ts` measured NINE divergences, and every one of them
+     fell out of that mechanism rather than out of nine separate mistakes:
+
+       - `currentDG` was cleared only inside the success branch, so an INTEGER
+         that never found its OCTET STRING stayed set and the NEXT hash paired
+         with it. That produced a table with ordinary looking numbers and one
+         row carrying a hash the document declared under no number at all.
+       - `[HEX DUMP]:` is absent when OpenSSL renders an OCTET STRING as
+         printable text or when it is empty, and the row was silently skipped.
+       - `Int(currentDG, radix: 16)` dropped rows whose number OpenSSL chose to
+         render differently, which is how a data group SEVENTEEN written as
+         `02 04 00 00 00 11` disappeared.
+       - Nothing checked that a `DataGroupHash` was a SEQUENCE of an INTEGER
+         then an OCTET STRING, so two INTEGERs and a hash invented rows.
+       - Nothing refused a repeated data group number.
+
+     And the `d=2`/`d=3` keys deserve their own line: depth is a property of the
+     ENCODING NESTING, so a parser keyed on it reads a different table the day an
+     encoder wraps one layer differently, with nothing going red.
+
+     WHY THIS MATTERS MORE THAN A PARSER BEING UNTIDY. The per-site account
+     number commits to the WHOLE signed table, so a row dropped, invented or
+     mis-paired here is in that person's number permanently, and it is STABLE:
+     the same document fails the same way on every read, so it never looks like
+     a bug. Only a second implementation reading the same bytes reveals it.
+
+     THE SHAPE, ICAO 9303 Part 10:
+
+         LDSSecurityObject ::= SEQUENCE {
+           version              INTEGER,
+           hashAlgorithm        DigestAlgorithmIdentifier,
+           dataGroupHashValues  SEQUENCE OF DataGroupHash,
+           ldsVersionInfo       LDSVersionInfo OPTIONAL }
+         DataGroupHash ::= SEQUENCE {
+           dataGroupNumber      INTEGER,
+           dataGroupHashValue   OCTET STRING }
+
+     STRICT ON POSITION, LENIENT ON THE TAIL, and the asymmetry is deliberate.
+     Position strictness is what makes mis-pairing structurally impossible.
+     An element AFTER the OCTET STRING is ignored rather than refused, because
+     the vector's `third-element-after-the-hash` case declares it accepted, it
+     sits inside content the issuing state SIGNED so nobody can add one without
+     breaking that signature, and we do not hold the normative text and so
+     cannot tell whether the module carries an extension marker. If it does,
+     refusing a trailing field would refuse every passport issued after the next
+     revision.
+
+     HEX IS UPPERCASE, WHICH IS NOT A STYLE CHOICE. `binToHexRep` uppercases,
+     the tamper check compares against it as a string, and `sodDataGroupHashes`
+     feeds the account number. Lowercasing here would fail every tamper check
+     and change every account number ever issued.
+
+     - Parameter signedData: the SOD's encapsulated content octets.
+     - Returns: the digest algorithm name, the mapped table, and every row as
+       the document declared it, in document order.
+     */
+    private func parseSODSignatureContent( _ signedData : Data ) throws -> (String, [DataGroupId : String], [SodDataGroupHash]){
+        let bytes = [UInt8](signedData)
+
+        /* The eContent IS the LDSSecurityObject, so there is exactly one
+           top level element and it is a SEQUENCE. Checking the count rather
+           than taking `first` refuses trailing rubbish after the structure. */
+        guard let top = DER.children(in: bytes, from: 0, to: bytes.count),
+              top.count == 1,
+              top[0].tag == DER.sequence else {
+            throw PassiveAuthenticationError.UnableToParseSODHashes( "The signed content is not a single DER SEQUENCE" )
+        }
+        guard let fields = DER.children(in: bytes, from: top[0].contentStart, to: top[0].contentEnd),
+              fields.count >= 3 else {
+            throw PassiveAuthenticationError.UnableToParseSODHashes( "The LDSSecurityObject is missing mandatory fields" )
+        }
+        guard fields[0].tag == DER.integer else {
+            throw PassiveAuthenticationError.UnableToParseSODHashes( "The LDSSecurityObject has no version" )
+        }
+
+        /* THE ALGORITHM FROM THE FIELD THAT HOLDS IT, not from whichever dump
+           line happened to contain the substring "sha256". The old reader keyed
+           on `d=2 OBJECT`, which is a DEPTH, so any OID rendered at that depth
+           could set it. */
+        guard fields[1].tag == DER.sequence,
+              let algorithmFields = DER.children(in: bytes, from: fields[1].contentStart, to: fields[1].contentEnd),
+              let oid = algorithmFields.first,
+              oid.tag == DER.objectIdentifier,
+              let sodHashAlgo = NFCPassportModel.digestName(
+                  for: Array(bytes[oid.contentStart..<oid.contentEnd]) ) else {
+            throw PassiveAuthenticationError.UnableToParseSODHashes( "Unable to find hash algorythm used" )
+        }
+
+        guard fields[2].tag == DER.sequence,
+              let tableRows = DER.children(in: bytes, from: fields[2].contentStart, to: fields[2].contentEnd) else {
+            throw PassiveAuthenticationError.UnableToParseSODHashes( "The data group hash table is not a SEQUENCE" )
+        }
+
+        var sodHashes : [DataGroupId : String] = [:]
         /* fravash: every row as the SOD carries it, keeping the raw number that
-           `sodHashes` cannot represent. Appended in document order and never
-           deduped: see `SodDataGroupHash`. */
+           `sodHashes` cannot represent. Appended in document order. */
         var sodRows : [SodDataGroupHash] = []
-        
-        let lines = content.components(separatedBy: "\n")
-        
+        var seen = Set<Int>()
+
         let dgList : [DataGroupId] = [.COM,.DG1,.DG2,.DG3,.DG4,.DG5,.DG6,.DG7,.DG8,.DG9,.DG10,.DG11,.DG12,.DG13,.DG14,.DG15,.DG16,.SOD]
 
-        for line in lines {
-            if line.contains( "d=2" ) && line.contains( "OBJECT" ) {
-                if line.contains( "sha1" ) {
-                    sodHashAlgo = "SHA1"
-                } else if line.contains( "sha224" ) {
-                    sodHashAlgo = "SHA224"
-                } else if line.contains( "sha256" ) {
-                    sodHashAlgo = "SHA256"
-                } else if line.contains( "sha384" ) {
-                    sodHashAlgo = "SHA384"
-                } else if line.contains( "sha512" ) {
-                    sodHashAlgo = "SHA512"
-                }
-            } else if line.contains("d=3" ) && line.contains( "INTEGER" ) {
-                if let range = line.range(of: "INTEGER") {
-                    let substr = line[range.upperBound..<line.endIndex]
-                    if let r2 = substr.range(of: ":") {
-                        currentDG = String(line[r2.upperBound...])
-                    }
-                }
-                
-            } else if line.contains("d=3" ) && line.contains( "OCTET STRING" ) {
-                if let range = line.range(of: "[HEX DUMP]:") {
-                    let val = line[range.upperBound..<line.endIndex]
-                    if currentDG != "", let id = Int(currentDG, radix:16) {
-                        /* fravash: the raw row first, because it is the one
-                           thing here that cannot be wrong. */
-                        sodRows.append( SodDataGroupHash( dataGroupNumber: id, hash: String(val) ) )
-
-                        /* fravash: AND ONLY THEN THE MAPPED ONE, IF IT MAPS.
-                           `id` is parsed straight out of the document and is
-                           unbounded; `dgList` has 18 entries. An SOD declaring
-                           data group 0x20, or a negative INTEGER, crashed here.
-                           An unmappable number is skipped rather than dropped:
-                           it is already in `sodRows` above. */
-                        if id >= 0 && id < dgList.count {
-                            sodHashes[dgList[id]] = String(val)
-                        }
-                        currentDG = ""
-                    }
-                }
+        for row in tableRows {
+            guard row.tag == DER.sequence,
+                  let parts = DER.children(in: bytes, from: row.contentStart, to: row.contentEnd),
+                  parts.count >= 2,
+                  parts[0].tag == DER.integer,
+                  parts[1].tag == DER.octetString else {
+                throw PassiveAuthenticationError.UnableToParseSODHashes( "A DataGroupHash is not an INTEGER followed by an OCTET STRING" )
             }
-        }
-        
-        if sodHashAlgo == "" {
-            throw PassiveAuthenticationError.UnableToParseSODHashes("Unable to find hash algorythm used" )
-        }
-        if sodHashes.count == 0 {
-            throw PassiveAuthenticationError.UnableToParseSODHashes("Unable to extract hashes" )
+            guard let id = DER.integerValue(bytes, from: parts[0].contentStart, to: parts[0].contentEnd) else {
+                throw PassiveAuthenticationError.UnableToParseSODHashes( "A DataGroupHash has a dataGroupNumber this reader cannot represent" )
+            }
+            /* A repeated number lets a forger offer two candidate hashes for one
+               group and have a lenient verifier match either. Refuse. */
+            guard seen.insert(id).inserted else {
+                throw PassiveAuthenticationError.UnableToParseSODHashes( "Data group \(id) appears more than once in the hash table" )
+            }
+
+            /* THE BYTES, so neither printable content nor a zero length can make
+               a row disappear the way `[HEX DUMP]:` did. */
+            let hash = binToHexRep( Array(bytes[parts[1].contentStart..<parts[1].contentEnd]) )
+
+            sodRows.append( SodDataGroupHash( dataGroupNumber: id, hash: hash ) )
+
+            /* AND ONLY THEN THE MAPPED ONE, IF IT MAPS. `id` comes straight out
+               of the document and is unbounded; `dgList` has 18 entries. An
+               unmappable number is skipped rather than dropped: it is already in
+               `sodRows` above. */
+            if id >= 0 && id < dgList.count {
+                sodHashes[dgList[id]] = hash
+            }
         }
 
         Logger.passportReader.debug( "Parse SOD - Using Algo - \(sodHashAlgo)" )
-        Logger.passportReader.debug( "      - Hashes     - \(sodHashes)" )
-        
+
         return (sodHashAlgo, sodHashes, sodRows)
+    }
+
+    /**
+     Map a digest OID's content bytes to the name the rest of this file uses.
+
+     BY BYTES RATHER THAN BY A RENDERED STRING. The old reader looked for the
+     substring "sha256" in a dump line, which is a text match against something
+     OpenSSL chose to print.
+     */
+    private static func digestName( for oidBytes : [UInt8] ) -> String? {
+        switch oidBytes {
+        case [0x2B, 0x0E, 0x03, 0x02, 0x1A]:                               return "SHA1"
+        case [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04]:       return "SHA224"
+        case [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]:       return "SHA256"
+        case [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]:       return "SHA384"
+        case [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]:       return "SHA512"
+        default:                                                            return nil
+        }
     }
 }
